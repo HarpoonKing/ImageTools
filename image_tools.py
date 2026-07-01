@@ -14,15 +14,17 @@ import subprocess
 import threading
 import queue
 from pathlib import Path
+from urllib.parse import urlparse, unquote
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+HAS_DND = False
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     HAS_DND = True
-except ImportError:
-    HAS_DND = False
+except (ImportError, RuntimeError):
+    pass
 
 from resize_core import (
     SUPPORTED_EXTS,
@@ -45,6 +47,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.minsize(700, 720)
 
         self.files: list[Path] = []
+        self.file_dims: dict[Path, tuple[int, int] | None] = {}
         self.in_root: Path | None = None
         self.msg_queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -133,8 +136,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         # 拖放支持
         if HAS_DND:
-            self.drop_target_register(DND_FILES)
-            self.dnd_bind('<<Drop>>', self._on_drop)
+            for widget in (self, self.file_list):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._on_drop)
+        else:
+            ttk.Label(
+                frm_in,
+                text="当前 Python/Tk 环境不支持拖拽，请使用“添加文件/文件夹”。",
+                style="Hint.TLabel",
+            ).pack(anchor="w", padx=8, pady=(0, 8))
 
         # 2. 模式
         frm_mode = ttk.LabelFrame(self, text=" ② 处理模式 ")
@@ -262,21 +272,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     # ---- 拖放 ----
     def _on_drop(self, event):
         """处理从系统拖入的文件/文件夹。"""
-        raw = event.data
-        # tkdnd 在 macOS 上用花括号包裹含空格的路径
-        paths: list[str] = []
-        if '{' in raw:
-            import re
-            paths = re.findall(r'\{([^}]+)\}', raw)
-            # 还有不含空格未被花括号包裹的部分
-            remaining = re.sub(r'\{[^}]+\}', '', raw).strip()
-            if remaining:
-                paths.extend(remaining.split())
-        else:
-            paths = raw.split()
+        raw = event.data or ""
+        try:
+            paths = list(self.tk.splitlist(raw))
+        except tk.TclError:
+            paths = [raw]
 
         added: list[Path] = []
         for p in paths:
+            p = p.strip()
+            if not p:
+                continue
+            if p.startswith("file://"):
+                parsed = urlparse(p)
+                p = unquote(parsed.path)
             pp = Path(p)
             if pp.is_dir():
                 found = [f for f in pp.rglob("*") if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS]
@@ -316,12 +325,21 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if p not in existing:
                 self.files.append(p)
                 existing.add(p)
+                if p not in self.file_dims:
+                    try:
+                        from PIL import Image as _Img
+                        with _Img.open(p) as _im:
+                            self.file_dims[p] = _im.size
+                    except Exception:
+                        self.file_dims[p] = None
         self._refresh_file_list()
 
     def _refresh_file_list(self):
         self.file_list.delete(0, "end")
         for p in self.files:
-            self.file_list.insert("end", p.name)
+            dims = self.file_dims.get(p)
+            label = f"{p.name}    {dims[0]} × {dims[1]}" if dims else p.name
+            self.file_list.insert("end", label)
         self.lbl_count.config(text=f"已选 {len(self.files)} 张")
         self.status.set(f"已选 {len(self.files)} 张图片"
                         + (f" · 输入目录 {self.in_root}" if self.in_root else ""))
@@ -336,6 +354,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _clear_files(self):
         self.files.clear()
+        self.file_dims.clear()
         self.in_root = None
         self._refresh_file_list()
 
